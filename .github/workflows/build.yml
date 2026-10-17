@@ -1,0 +1,76 @@
+# Build -> push to ECR -> bump the tag in the gitops repo. Argo CD does the deploy.
+#
+# CI never talks to the cluster (GitOps pull model), so the EKS endpoint can
+# stay locked down. AWS creds come from OIDC (vars.AWS_ROLE_ARN); the only
+# secret is a deploy key that can write to ONE repo: the gitops repo.
+# Third-party actions are pinned by commit SHA (tag in the comment) so a
+# re-pointed tag can't inject code (tj-actions/changed-files, March 2025).
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC JWT for AWS
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - id: meta
+        run: |
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image=${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ steps.meta.outputs.tag }}
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          provenance: false # no attestation manifests: keeps the ECR image list readable
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.GITOPS_REPO }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+
+      - name: Bump image tag in gitops repo
+        working-directory: gitops
+        env:
+          FILE: workloads/${{ vars.APP_NAME }}/kustomization.yaml
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          sed -i -E "s|^(\s*newTag:).*|\1 \"${TAG}\"|" "$FILE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FILE"
+          git diff --cached --quiet && { echo "tag unchanged"; exit 0; }
+          git commit -m "${{ vars.APP_NAME }}: ${TAG} (${{ github.repository }}@${GITHUB_SHA::7})"
+          # Both app repos push here; retry on a race.
+          for i in 1 2 3; do git pull --rebase && git push && exit 0; sleep $((i * 3)); done
+          exit 1
